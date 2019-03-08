@@ -962,9 +962,12 @@ public class Mat {
                 " ]";
     }
 
-    // javadoc:Mat::dump()
     public String dump() {
         return nDump(nativeObj);
+    }
+
+    public void dumpToFile(String filePath) {
+        nDumpToFile(nativeObj, filePath);
     }
 
     // javadoc:Mat::put(row,col,data)
@@ -1378,4 +1381,6 @@ public class Mat {
     private static native double[] nGet(long self, int row, int col);
 
     private static native String nDump(long self);
+
+    private static native void nDumpToFile(long self, String filePath);
 }

@@ -6,6 +6,7 @@
 
 #define LOG_TAG "org.opencv.core.Mat"
 #include "common.h"
+#include <fstream>
 
 using namespace cv;
 
@@ -2173,6 +2174,28 @@ JNIEXPORT jstring JNICALL Java_org_opencv_core_Mat_nDump
     }
 
     return 0;
+}
+
+JNIEXPORT void JNICALL Java_org_opencv_core_Mat_nDumpToFile
+  (JNIEnv *env, jclass, jlong self, jstring filePath);
+
+JNIEXPORT void JNICALL Java_org_opencv_core_Mat_nDumpToFile
+  (JNIEnv *env, jclass, jlong self, jstring filePath)
+{
+    static const char method_name[] = "Mat::nDumpToFile()";
+    try {
+        LOGD("%s", method_name);
+        cv::Mat* me = (cv::Mat*) self; //TODO: check for NULL
+        const char* utfFilePath = env->GetStringUTFChars(filePath, 0);
+        std::ofstream fileStream(utfFilePath, std::fstream::out);
+        env->ReleaseStringUTFChars(filePath, utfFilePath);
+        fileStream << *me << std::endl;
+        fileStream.close();
+    } catch(const std::exception &e) {
+        throwJavaException(env, &e, method_name);
+    } catch (...) {
+        throwJavaException(env, 0, method_name);
+    }
 }
 
 

@@ -206,6 +206,7 @@ Ptr<IVideoCapture> createGPhoto2Capture(const std::string& deviceName);
 
 Ptr<IVideoCapture> createXINECapture(const std::string &filename);
 
+Ptr<IVideoCapture> createAndroidCapture_cam( int index );
 Ptr<IVideoCapture> createAndroidCapture_file(const std::string &filename);
 
 } // cv::

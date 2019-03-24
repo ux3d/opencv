@@ -25,6 +25,22 @@ task clean(type: Delete) {
     delete rootProject.buildDir
 }
 
+// prevent the Android build from stripping debug info from the native OpenCV library
+// actually the strip task is still executed but we overwrite the stripped library with the original unstripped library after it completes
+subprojects {
+    task overwriteStrippedLibrary(type: Copy) {
+        from 'build/intermediates/transforms/mergeJniLibs/debug'
+        into 'build/intermediates/transforms/stripDebugSymbol/debug'
+        include '**/libopencv*.so'
+    }
+
+    tasks.whenTaskAdded {task ->
+        if (task.name.contains("transformNativeLibsWithStripDebugSymbolForDebug")) {
+            task.finalizedBy(overwriteStrippedLibrary)
+        }
+    }
+}
+
 //allprojects {
 //    gradle.projectsEvaluated {
 //        tasks.withType(JavaCompile) {

@@ -1565,6 +1565,12 @@ if(BUILD_JAVA)
   status("    Java tests:"    BUILD_TESTS AND opencv_test_java_BINARY_DIR                                 THEN YES ELSE NO)
 endif()
 
+# ========================== Objective-C =======================
+if(BUILD_OBJC)
+  status("")
+  status("  Objective-C wrappers:" HAVE_opencv_objc                                        THEN YES ELSE NO)
+endif()
+
 ocv_cmake_hook(STATUS_DUMP_EXTRA)
 
 # ========================== auxiliary ==========================

@@ -42,11 +42,17 @@
 
 #include "../precomp.hpp"
 #include "layers_common.hpp"
+#include "../op_cuda.hpp"
 #include "../op_halide.hpp"
 #include "../op_inf_engine.hpp"
 
 #ifdef HAVE_OPENCL
 #include "opencl_kernels_dnn.hpp"
+#endif
+
+#ifdef HAVE_CUDA
+#include "../cuda4dnn/primitives/eltwise.hpp"
+using namespace cv::dnn::cuda4dnn;
 #endif
 
 namespace cv
@@ -64,6 +70,7 @@ public:
         MAX = 2,
     } op;
     std::vector<float> coeffs;
+    bool variableChannels;
 
     EltwiseLayerImpl(const LayerParams& params)
     {
@@ -97,8 +104,9 @@ public:
     virtual bool supportBackend(int backendId) CV_OVERRIDE
     {
         return backendId == DNN_BACKEND_OPENCV ||
+               backendId == DNN_BACKEND_CUDA ||
                backendId == DNN_BACKEND_HALIDE ||
-               (backendId == DNN_BACKEND_INFERENCE_ENGINE &&
+               (backendId == DNN_BACKEND_INFERENCE_ENGINE && !variableChannels &&
                 (preferableTarget != DNN_TARGET_OPENCL || coeffs.empty()));
     }
 
@@ -108,57 +116,89 @@ public:
                          std::vector<MatShape> &internals) const CV_OVERRIDE
     {
         CV_Assert(inputs.size() >= 2);
+        CV_Assert(inputs[0].size() >= 2);
         CV_Assert(coeffs.size() == 0 || coeffs.size() == inputs.size());
         CV_Assert(op == SUM || coeffs.size() == 0);
 
+        int dims = inputs[0].size();
+        // Number of channels in output shape is determined by the first input tensor.
+        int numChannels = inputs[0][1];
         for (int i = 1; i < inputs.size(); i++)
         {
-            CV_Assert(inputs[0] == inputs[i]);
+            CV_Assert(inputs[0][0] == inputs[i][0]);
+
+            // It's allowed for channels axis to be different.
+            for (int j = 2; j < dims; j++)
+                CV_Assert(inputs[0][j] == inputs[i][j]);
         }
 
         outputs.assign(1, inputs[0]);
-
+        outputs[0][1] = numChannels;
         return false;
     }
+
+    void finalize(InputArrayOfArrays inputs_arr, OutputArrayOfArrays) CV_OVERRIDE
+    {
+        std::vector<Mat> inputs;
+        inputs_arr.getMatVector(inputs);
+        variableChannels = false;
+        for (int i = 1; i < inputs.size(); ++i)
+        {
+            if (inputs[i].size[1] != inputs[0].size[1])
+            {
+                variableChannels = true;
+                break;
+            }
+        }
+    }
+
 
     class EltwiseInvoker : public ParallelLoopBody
     {
     public:
-        const Mat* srcs;
+        std::vector<const Mat*> srcs;
         int nsrcs;
         Mat* dst;
-        const std::vector<float>* coeffs;
+        std::vector<float> coeffs;
         EltwiseOp op;
         int nstripes;
         const ActivationLayer* activ;
         int channels;
         size_t planeSize;
 
-        EltwiseInvoker() : srcs(0), nsrcs(0), dst(0), coeffs(0), op(PROD), nstripes(0), activ(0), channels(0), planeSize(0)  {}
+        EltwiseInvoker() : nsrcs(0), dst(0), op(PROD), nstripes(0), activ(0), channels(0), planeSize(0)  {}
 
         static void run(const Mat* srcs, int nsrcs, Mat& dst,
                         const std::vector<float>& coeffs, EltwiseOp op,
                         const ActivationLayer* activ, int nstripes)
         {
-            CV_Check(dst.dims, 1 < dst.dims && dst.dims <= 4, ""); CV_CheckTypeEQ(dst.type(), CV_32FC1, ""); CV_Assert(dst.isContinuous());
+            CV_Check(dst.dims, 1 < dst.dims && dst.dims <= 5, ""); CV_CheckTypeEQ(dst.type(), CV_32FC1, ""); CV_Assert(dst.isContinuous());
             CV_Assert(coeffs.empty() || coeffs.size() == (size_t)nsrcs);
 
-            for( int i = 0; i > nsrcs; i++ )
+            EltwiseInvoker p;
+            p.srcs.resize(nsrcs);
+            p.coeffs = coeffs;
+            for( int i = 0; i < nsrcs; i++ )
             {
-                CV_Assert(srcs[i].size == dst.size &&
-                          srcs[i].type() == dst.type() &&
+                p.srcs[i] = srcs + i;
+                CV_Assert(srcs[i].type() == dst.type() &&
                           srcs[i].isContinuous());
+                // Sort srcs and coefficients in the order by number of channels
+                for( int j = i; j >= 1 && p.srcs[j - 1]->size[1] < p.srcs[j]->size[1]; j-- )
+                {
+                    std::swap(p.srcs[j - 1], p.srcs[j]);
+                    if (!p.coeffs.empty())
+                        std::swap(p.coeffs[j - 1], p.coeffs[j]);
+                }
             }
 
-            EltwiseInvoker p;
-            p.srcs = srcs;
             p.nsrcs = nsrcs;
             p.dst = &dst;
             p.op = op;
             p.nstripes = nstripes;
-            p.channels = (dst.dims == 4 ? dst.size[1] : 1);
-            p.planeSize = (dst.dims >= 3 ? dst.size[dst.dims - 1] * dst.size[dst.dims - 2] :
-                                           dst.size[dst.dims - 1]);
+            p.channels = (dst.dims >= 4 ? dst.size[1] : 1);
+
+            p.planeSize = dst.total(dst.dims >= 4 ? 2 : 1);
             CV_Assert(dst.total() == dst.size[0] * p.channels * p.planeSize);
 
             bool simpleCoeffs = true;
@@ -173,7 +213,8 @@ public:
                         break;
                     }
             }
-            p.coeffs = simpleCoeffs ? 0 : &coeffs;
+            if (simpleCoeffs)
+                p.coeffs.clear();
             p.activ = activ;
 
             parallel_for_(Range(0, nstripes), p, nstripes);
@@ -185,8 +226,8 @@ public:
             size_t stripeSize = (total + nstripes - 1)/nstripes;
             size_t stripeStart = r.start*stripeSize;
             size_t stripeEnd = std::min(r.end*stripeSize, total);
-            int c, j, k, n = nsrcs;
-            const float* coeffsptr = coeffs && !coeffs->empty() ? &coeffs->at(0) : 0;
+            int c, j, k, n;
+            const float* coeffsptr = !coeffs.empty() ? &coeffs[0] : 0;
             float* dstptr0 = dst->ptr<float>();
             int blockSize0 = 1 << 12, blockSize;
 
@@ -201,14 +242,35 @@ public:
                 for( c = 0; c < channels; c++ )
                 {
                     size_t globalDelta = delta + (sampleIdx*channels + c)*planeSize;
-                    const float* srcptr0 = srcs[0].ptr<float>() + globalDelta;
+                    const float* srcptr0 = srcs[0]->ptr<float>() + globalDelta;
                     float* dstptr = dstptr0 + globalDelta;
 
-                    if( op == PROD )
+                    // This code assumes that srcs are sorted in descending order by channels.
+                    for (n = 1; n < nsrcs && c < srcs[n]->size[1]; ++n) {}
+
+                    if (n == 1)
+                    {
+                        if( !coeffsptr )
+                        {
+                            for( j = 0; j < blockSize; j++ )
+                            {
+                                dstptr[j] = srcptr0[j];
+                            }
+                        }
+                        else
+                        {
+                            float c0 = coeffsptr[0];
+                            for( j = 0; j < blockSize; j++ )
+                            {
+                                dstptr[j] = c0*srcptr0[j];
+                            }
+                        }
+                    }
+                    else if( op == PROD )
                     {
                         for( k = 1; k < n; k++ )
                         {
-                            const float* srcptr1 = srcs[k].ptr<float>() + globalDelta;
+                            const float* srcptr1 = srcs[k]->ptr<float>() + globalDelta;
                             for( j = 0; j < blockSize; j++ )
                             {
                                 dstptr[j] = srcptr0[j]*srcptr1[j];
@@ -220,7 +282,7 @@ public:
                     {
                         for( k = 1; k < n; k++ )
                         {
-                            const float* srcptr1 = srcs[k].ptr<float>() + globalDelta;
+                            const float* srcptr1 = srcs[k]->ptr<float>() + globalDelta;
                             for( j = 0; j < blockSize; j++ )
                             {
                                 dstptr[j] = std::max(srcptr0[j], srcptr1[j]);
@@ -232,7 +294,7 @@ public:
                     {
                         for( k = 1; k < n; k++ )
                         {
-                            const float* srcptr1 = srcs[k].ptr<float>() + globalDelta;
+                            const float* srcptr1 = srcs[k]->ptr<float>() + globalDelta;
                             for( j = 0; j < blockSize; j++ )
                             {
                                 dstptr[j] = srcptr0[j] + srcptr1[j];
@@ -245,7 +307,7 @@ public:
                         float c0 = coeffsptr[0];
                         for( k = 1; k < n; k++ )
                         {
-                            const float* srcptr1 = srcs[k].ptr<float>() + globalDelta;
+                            const float* srcptr1 = srcs[k]->ptr<float>() + globalDelta;
                             float c1 = coeffsptr[k];
                             for( j = 0; j < blockSize; j++ )
                             {
@@ -272,7 +334,7 @@ public:
         std::vector<UMat> inputs;
         std::vector<UMat> outputs;
 
-        if (inputs_.depth() == CV_16S && op != SUM)
+        if ((inputs_.depth() == CV_16S && op != SUM) || variableChannels)
             return false;
 
         inputs_.getUMatVector(inputs);
@@ -374,6 +436,28 @@ public:
                             coeffs, op, activ.get(), nstripes);
     }
 
+#ifdef HAVE_CUDA
+    Ptr<BackendNode> initCUDA(
+        void *context_,
+        const std::vector<Ptr<BackendWrapper>>& inputs,
+        const std::vector<Ptr<BackendWrapper>>& outputs
+    ) override
+    {
+        auto context = reinterpret_cast<csl::CSLContext*>(context_);
+
+        auto op_ = [this] {
+            switch (op) {
+            case MAX: return cuda4dnn::EltwiseOpType::MAX;
+            case SUM: return cuda4dnn::EltwiseOpType::SUM;
+            case PROD: return cuda4dnn::EltwiseOpType::PRODUCT;
+            }
+            return cuda4dnn::EltwiseOpType::SUM;
+        }();
+
+        return make_cuda_node<cuda4dnn::EltwiseOp>(preferableTarget, std::move(context->stream), op_, coeffs);
+    }
+#endif
+
     virtual Ptr<BackendNode> initHalide(const std::vector<Ptr<BackendWrapper> > &input) CV_OVERRIDE
     {
 #ifdef HAVE_HALIDE
@@ -420,10 +504,9 @@ public:
         return Ptr<BackendNode>();
     }
 
+#ifdef HAVE_INF_ENGINE
     virtual Ptr<BackendNode> initInfEngine(const std::vector<Ptr<BackendWrapper> >& inputs) CV_OVERRIDE
     {
-#ifdef HAVE_INF_ENGINE
-#if INF_ENGINE_VER_MAJOR_GE(INF_ENGINE_RELEASE_2018R5)
         InferenceEngine::Builder::EltwiseLayer ieLayer(name);
 
         ieLayer.setInputPorts(std::vector<InferenceEngine::Port>(inputs.size()));
@@ -442,26 +525,8 @@ public:
             l.getParameters()["coeff"] = coeffs;
 
         return Ptr<BackendNode>(new InfEngineBackendNode(l));
-#else
-        InferenceEngine::LayerParams lp;
-        lp.name = name;
-        lp.type = "Eltwise";
-        lp.precision = InferenceEngine::Precision::FP32;
-        std::shared_ptr<InferenceEngine::EltwiseLayer> ieLayer(new InferenceEngine::EltwiseLayer(lp));
-        ieLayer->coeff = coeffs;
-        if (op == SUM)
-            ieLayer->_operation = InferenceEngine::EltwiseLayer::Sum;
-        else if (op == PROD)
-            ieLayer->_operation = InferenceEngine::EltwiseLayer::Prod;
-        else if (op == MAX)
-            ieLayer->_operation = InferenceEngine::EltwiseLayer::Max;
-        else
-            CV_Error(Error::StsNotImplemented, "Unsupported eltwise operation");
-        return Ptr<BackendNode>(new InfEngineBackendNode(ieLayer));
-#endif
-#endif  // HAVE_INF_ENGINE
-        return Ptr<BackendNode>();
     }
+#endif  // HAVE_INF_ENGINE
 
     virtual int64 getFLOPS(const std::vector<MatShape> &inputs,
                            const std::vector<MatShape> &outputs) const CV_OVERRIDE

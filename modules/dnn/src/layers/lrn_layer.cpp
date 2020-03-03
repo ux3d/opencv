@@ -42,6 +42,7 @@
 
 #include "../precomp.hpp"
 #include "layers_common.hpp"
+#include "../op_cuda.hpp"
 #include "../op_halide.hpp"
 #include "../op_inf_engine.hpp"
 #include "../op_vkcom.hpp"
@@ -53,6 +54,11 @@
 #ifdef HAVE_OPENCL
 #include "opencl_kernels_dnn.hpp"
 using namespace cv::dnn::ocl4dnn;
+#endif
+
+#ifdef HAVE_CUDA
+#include "../cuda4dnn/primitives/lrn.hpp"
+using namespace cv::dnn::cuda4dnn;
 #endif
 
 namespace cv
@@ -92,8 +98,9 @@ public:
     virtual bool supportBackend(int backendId) CV_OVERRIDE
     {
         if (backendId == DNN_BACKEND_INFERENCE_ENGINE)
-            return (bias == 1) && (preferableTarget != DNN_TARGET_MYRIAD || type == SPATIAL_NRM);
+            return bias == (int)bias;
         return backendId == DNN_BACKEND_OPENCV ||
+               backendId == DNN_BACKEND_CUDA ||
                backendId == DNN_BACKEND_HALIDE ||
                (backendId == DNN_BACKEND_VKCOM && haveVulkan() && (size % 2 == 1) && (type == CHANNEL_NRM));
     }
@@ -309,6 +316,46 @@ public:
         }
     }
 
+#ifdef HAVE_CUDA
+    Ptr<BackendNode> initCUDA(
+        void *context_,
+        const std::vector<Ptr<BackendWrapper>>& inputs,
+        const std::vector<Ptr<BackendWrapper>>& outputs
+    ) override
+    {
+        auto context = reinterpret_cast<csl::CSLContext*>(context_);
+
+        cuda4dnn::LRNType type_;
+        if (type == CHANNEL_NRM)
+            type_ = cuda4dnn::LRNType::ACROSS_CHANNELS;
+        else if (type == SPATIAL_NRM)
+            type_ = cuda4dnn::LRNType::WITHIN_CHANNEL;
+        else
+            CV_Error(Error::StsNotImplemented, "Unknown normalization region");
+
+        float alphaSize = alpha;
+        if (!normBySize) {
+            switch (type) {
+            case CHANNEL_NRM: alphaSize = alpha * size; break;
+            case SPATIAL_NRM: alphaSize = alpha * size * size; break;
+            }
+        }
+
+        std::size_t largestInputSize = 0;
+        for(auto& wrapper : inputs) {
+            auto input_wrapper = wrapper.dynamicCast<CUDABackendWrapper>();
+            auto shape = input_wrapper->getShape();
+            largestInputSize = std::max<std::size_t>(
+                largestInputSize,
+                std::accumulate(std::begin(shape), std::end(shape), 1, std::multiplies<int>())
+            );
+        }
+
+        return make_cuda_node<cuda4dnn::LRNOp>(preferableTarget,
+            std::move(context->cudnn_handle), type_, size, alphaSize, beta, bias, largestInputSize);
+    }
+#endif
+
     virtual Ptr<BackendNode> initVkCom(const std::vector<Ptr<BackendWrapper> > &inputs) CV_OVERRIDE
     {
 #ifdef HAVE_VULKAN
@@ -391,13 +438,13 @@ public:
 #endif  // HAVE_HALIDE
     }
 
+#ifdef HAVE_INF_ENGINE
     virtual Ptr<BackendNode> initInfEngine(const std::vector<Ptr<BackendWrapper> >&) CV_OVERRIDE
     {
-#ifdef HAVE_INF_ENGINE
         float alphaSize = alpha;
         if (!normBySize)
             alphaSize *= (type == SPATIAL_NRM ? size*size : size);
-#if INF_ENGINE_VER_MAJOR_GE(INF_ENGINE_RELEASE_2018R5)
+
         InferenceEngine::Builder::NormLayer ieLayer(name);
         ieLayer.setSize(size);
         ieLayer.setAlpha(alphaSize);
@@ -407,23 +454,8 @@ public:
         InferenceEngine::Builder::Layer l = ieLayer;
         l.getParameters()["k"] = bias;
         return Ptr<BackendNode>(new InfEngineBackendNode(l));
-#else
-        InferenceEngine::LayerParams lp;
-        lp.name = name;
-        lp.type = "Norm";
-        lp.precision = InferenceEngine::Precision::FP32;
-        std::shared_ptr<InferenceEngine::NormLayer> ieLayer(new InferenceEngine::NormLayer(lp));
-
-        ieLayer->_size = size;
-        ieLayer->_k = (int)bias;
-        ieLayer->_beta = beta;
-        ieLayer->_alpha = alphaSize;
-        ieLayer->_isAcrossMaps = (type == CHANNEL_NRM);
-        return Ptr<BackendNode>(new InfEngineBackendNode(ieLayer));
-#endif
-#endif  // HAVE_INF_ENGINE
-        return Ptr<BackendNode>();
     }
+#endif  // HAVE_INF_ENGINE
 
     virtual int64 getFLOPS(const std::vector<MatShape> &inputs,
                            const std::vector<MatShape> &outputs) const CV_OVERRIDE
